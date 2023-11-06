@@ -1,0 +1,811 @@
+---
+title: "elk microbiome analysis"
+output: html_document
+date: "2023-07-21"
+editor_options: 
+  chunk_output_type: console
+---
+
+Introduction and Notes
+
+This code will take the output from elk_microbiome_thru_decontam.rmd and use it to generate input for divnet-rs (which can be run on an HPC cluster as a conda environment)
+After running divnet-rs, the code takes the resulting diversity estimates and generates Simpson and Shannon indices from them
+The code also generates box-whisker plots of the alpha diversity indices
+
+Additionally, this code uses corncob to estimate relative abundance of taxa within a given set of data
+For the elk microbiome analysis, we used this to get the general abundance of a taxon within all the data of a given sample type. 
+
+However, this code can be used to determine the estimated relative abundance of taxa given any set of data
+
+RUN THIS CODE AFTER ELK MICROBIOME ELK_MICROBIOME_THRU_DECONTAM.RMD
+DO NOT CLEAR ENVIRONMENT AFTER RUNNING THE ABOVE SCRIPT
+
+```{r}
+
+# The below is based on code written by Dr. Laura Tibbs-Cortes
+# 
+# Working environment should be structured like the following:
+# 
+# [PROJECT FOLDER]
+#     |-->[taxonomy]
+#     |      |---------> stability.cons.taxonomy
+#     |-->[shared]
+#     |      |---------> stability.opti_mcc.shared
+#     |-->[design]
+#     |      |---------> metadata.csv
+#     |-->[sas]
+#     |      |----------> working_with_phyloseq_OTU_comparison_7_19_21.R
+#     |--> working_with_phyloseq_subsetting_7_19_21.R
+
+```
+
+Setup: install and load packages, set seed, remove earlier objects
+
+```{r}
+
+# decontam and phyloseq must be installed in the following manner
+# all other packages can be installed using install.packages
+
+# if (!requireNamespace("BiocManager"))
+# install.packages("BiocManager")
+# BiocManager::install("phyloseq")
+# BiocManager::install("decontam")
+
+# remotes::install_github("adw96/breakaway")
+# remotes::install_github("adw96/DivNet")
+# devtools::install_github("bryandmartin/corncob")
+library(DivNet)
+library(magrittr)
+library(corncob)
+library(tictoc)
+
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(ggpubr)
+library(dplyr)
+library(scales)
+library(grid)
+library(reshape2)
+library(data.table)
+#library("xlsx")
+library(openxlsx)
+library(stringr)
+library(tibble)
+library(splitstackshape)
+library(viridis)
+library(remotes)
+library(tidyverse)
+library(decontam)
+library(gridExtra)
+library(ggsignif)
+library(svglite)
+library(cowplot)
+
+# Change output from scientific notation to readable format
+options(scipen=999)
+
+# Add random number for reproducibility
+# Number generated from random.org - Min: 100000, Max: 999999, Date: 2023-07-21 18:02:06 UTC
+set.seed(469648)
+
+rm(list=setdiff(ls(), "data_final"))
+
+#remove(data_merge, data_merge_decon, data_sub, regex.escape, total_trimmed_seqs, standard_deviation_of_sequencing_depth, LOWEST_SAMPLE_SIZE, average_sequencing_depth)
+
+```
+
+Subset data by pairwise comparison
+
+```{r}
+
+# Pull the column names from the design file that correspond to the comparisons
+# If a sample is part of a comparison, the value is TRUE
+comparisons <- colnames(as.data.frame(read.csv("design/design.csv")))[10:37]
+comparisons <- comparisons[grep("all", comparisons)]
+
+# For each column name, keep only rows where the data in that column equals "TRUE"
+# Using assign, make this pruned dataset a new phyloseq object
+for (i in comparisons) {
+  assign(paste0("subset_",i), prune_samples(sample_data(data_final)[[i]] == "TRUE", data_final))
+}
+
+subset_V_total <- subset_V_all_CvR
+subset_F_total <- subset_F_all_CvR
+
+
+```
+
+Prepare input for running Divnet-rs on the HPC
+
+```{r}
+
+# Divnet is slow, and I have a bunch of pairwise comparisons
+# Means I'll need to run it on the server
+# The below generates the necessary input files from the subset phyloseq objects created previously
+prep_divnet <- function(physeqobj) {
+  
+  # Make count table
+  temp = as(otu_table(physeqobj), "matrix")
+  counts <- as_tibble(temp)
+  counts$OTU <- rownames(temp)
+  counts <- counts %>% select(OTU, everything())
+  fwrite(counts, paste0("divnet_input/counts_", deparse(substitute(physeqobj)), ".csv", sep = ""))
+  
+  # Make sample data
+  
+  # Need to identify what is going to be compared for this phyloseq object: vax status or timepoint
+  # The last part of the physeqobj's name is indicates what is to be compared
+  compar_var <- str_remove(string = deparse(substitute(physeqobj)), pattern = ".+_")
+  
+  # If it's CvR, then vax status
+  # If it's total, then full model Vax_Status plus Time
+  # Otherwise, time is the variable to compare by  
+  if (compar_var == "CvR") {
+    samdata <- model.matrix(object =~ Vax_Status, data = as_tibble(physeqobj@sam_data))
+  } else if (compar_var == "total") {
+    samdata <- model.matrix(object =~ Vax_Status + Time, data = as_tibble(physeqobj@sam_data) )
+  } else { 
+    samdata <- model.matrix(object =~ Time, data = as_tibble(physeqobj@sam_data))
+  }
+  
+  fwrite(cbind(tibble(sample = physeqobj@sam_data$Sample),
+               type = as_tibble(samdata)[,-1]),
+         paste0("divnet_input/samdata_", deparse(substitute(physeqobj)), ".csv", sep = ""))
+}
+
+prep_divnet(subset_V_total)
+prep_divnet(subset_F_total)
+
+# Take the resulting files and bring them over to HPC cluster for analysis using divnet-rs
+
+```
+
+Divnet-rs output processing
+
+```{r}
+
+# based on https://github.com/mooreryan/divnet-rs/blob/master/test_files/lee_data_walkthrough/3_import_divnet_rs_data.R
+# use the information produced by Divnet-rs to calculate variances and estimates for each time/treatment
+
+divnet_rs_processing <- function(output_file){
+  
+  # reference the subsetted phyloseq object associated with this pairwise comparison
+  physeqobj <- get(str_remove(string = output_file, pattern = "_output.csv"))
+  
+  # need to identify what is going to be compared for this phyloseq object: vax status or timepoint
+  # the last part of the phyobj's name indicates what is to be compared
+  # if it's CvR, then vax status
+  # otherwise, time is the variable to compare by
+  name_pairwise <- str_remove(string = output_file, pattern = "subset_")
+  name_pairwise <- str_remove(string = name_pairwise, pattern = "_output.csv")
+  name_pairwise1 <- str_remove(string = name_pairwise, pattern = ".+_")
+
+  if (name_pairwise1 == "CvR") {
+    formcompar = "Vax_Status"
+  } else if (name_pairwise1 == "total") {
+    formcompar = "Replicate_ID"
+  } else {
+    formcompar = "Time"
+  }
+  
+  print(name_pairwise)
+  
+  # set number of replicates 
+  nreplicates = 5
+
+  # import the divnet-rs output file
+  # using fread, cmd command
+    # first stage changes working directory for WindowsOS (has a different working directory than R)
+    # second command imports all lines in the target file that DON'T start with #
+    # need to first create a variable to store the invariable part of the command
+  command <- paste0(
+    'cd C:/Users/Bienvenido.Tibbs-Cor/Documents/Brucella/Microbiome/R/divnet_output && findstr "^[^#]"')
+  
+  divnet_rs <- fread(cmd = paste0(command, " ", output_file), 
+                     sep = ",", header = TRUE, data.table = F, fill = T)
+  
+  # replicate 0 is actually the estimates for the real data
+  # pull rep0 as a list and give it an empty sublist called sample
+  rep0 <- divnet_rs[divnet_rs$replicate == 0, -1]
+  rownames(rep0) <- rep0$sample
+  rep0$sample <- NULL
+  
+  #print("imported and rep0 pulled")
+  
+  ##### SHANNON
+  # find the shannon diversity for rep0
+  rep0_shannon <- apply(rep0, 1, DivNet::shannon_true)
+
+  # now calculate the shannon diversity for the replicates
+  reps_shannon <- sapply(1:nreplicates, function (i) {
+    d <- divnet_rs[divnet_rs$replicate == i, -1]
+    rownames(d) <- d$sample
+    d$sample <- NULL
+    
+    apply(d, 1, DivNet::shannon_true)
+  })
+  
+  # calculate the variance in the shannon diversity estimates for the replicates
+  reps_shannon_error <- t(apply(reps_shannon, 1, function (x) {
+    c(var(x), sd(x))
+  }))
+  
+  shannon.pairwise <- betta(chats=unname(rep0_shannon),
+                      sqrt(unname(reps_shannon_error[,1])),
+                      breakaway::make_design_matrix(physeqobj, formcompar))
+  shannon.pairwise$table
+
+  print("Shannon")
+  print(shannon.pairwise$table)
+
+  ##### SIMPSON
+  # get the Simpson index for the actual data
+  rep0_simpson <- apply(rep0, 1, DivNet::simpson_true)
+
+  # calculate the simpson index for the replicates
+  reps_simpson <- sapply(1:nreplicates, function (i) {
+    d <- divnet_rs[divnet_rs$replicate == i, -1]
+    rownames(d) <- d$sample
+    d$sample <- NULL
+
+    apply(d, 1, DivNet::simpson_true)
+  })
+
+  # What we want is the variance in the diversity estimates for the replicates.
+  reps_simpson_error <- t(apply(reps_simpson, 1, function (x) {
+    c(var(x), sd(x))
+  }))
+
+  colnames(reps_simpson_error) <- c("variance", "sd")
+
+  simpson.pairwise <- betta(chats=unname(rep0_simpson),
+                      sqrt(unname(reps_simpson_error[,1])),
+                      breakaway::make_design_matrix(physeqobj, formcompar))
+  simpson.pairwise$table
+
+  # output estimates
+  shannon.tibble = tibble(Sample_ID=names(rep0_shannon),
+                          shannon.est=rep0_shannon,
+                          shannon.var=unname(reps_shannon_error[,1]))
+
+  simpson.tibble = tibble(Sample_ID=names(rep0_simpson),
+                          simpson.est=rep0_simpson,
+                          simpson.var=unname(reps_simpson_error[,1]))
+
+  print("Simpson")
+  print(simpson.pairwise$table)
+
+
+  # if doing multiple pairwise comparisons, need to output the simpson and shannon components
+    # in this case, the only simpson and shannon stats generated here are for the reference level
+      # (the first Replicate_ID alphabetically) vs itself and all other Replicate_IDs
+  
+  if (formcompar == "Replicate_ID") {
+    assign(paste0("shannon_pairwise_", name_pairwise), shannon.pairwise, globalenv())
+    assign(paste0("simpson_pairwise_", name_pairwise), simpson.pairwise, globalenv())
+  }
+  
+  # create workbook
+  workbook <- createWorkbook()
+
+  addWorksheet(workbook, paste0("Shannon_", name_pairwise))
+  addWorksheet(workbook, paste0("Simpson_", name_pairwise))
+
+  # write to the workbook
+  writeData(workbook,
+    paste0("Shannon_", name_pairwise),
+    left_join(shannon.tibble, as_tibble(physeqobj@sam_data) %>% select(Sample_ID, Type, Vax_Status, Time)),
+    startRow = 1, startCol = 1)
+
+  writeData(workbook,
+    paste0("Simpson_", name_pairwise),
+    left_join(simpson.tibble, as_tibble(physeqobj@sam_data) %>% select(Sample_ID, Type, Vax_Status, Time)),
+    startRow = 1, startCol = 1)
+
+  saveWorkbook(workbook, file =
+        paste0("alpha_diversity/alpha_diversity_", name_pairwise, "_estimates.xlsx"), overwrite = TRUE)
+
+}
+
+#lapply(list.files(path = "./divnet_output"), divnet_rs_processing)
+
+divnet_rs_processing("subset_V_total_output.csv")
+divnet_rs_processing("subset_F_total_output.csv")
+
+```
+
+Create functions and input for statistical analysis of processed Divnet-rs output
+
+```{r}
+
+# for experiments beyond 1 for 1 pairwise comparisons, need to run pairwise comparisons across all treatment combinations
+# also need to account for multiple testing
+# use betta_lincom function
+# FROM https://raw.githubusercontent.com/adw96/breakaway/master/R/betta_lincom.R
+     # https://github.com/adw96/breakaway/blob/main/R/betta_lincom.R
+# the betta_lincom function takes as an argument "linear_com",
+    # a vector describing the comparison to be made
+    # the baseline is represented by 1
+    # the comparison is represented by -1
+    # all unused fixed effects are 0
+    # so for an experiment with 5 fixed effects comparing effects 2 and 4:
+      # c(0,1,0,-1,0)
+betta_lincom <- function(fitted_betta, linear_com, signif_cutoff = 0.05){
+
+  cov_mat <- fitted_betta$cov
+
+  est <- sum(linear_com*fitted_betta$table[,1])
+
+  se <- sqrt(matrix(linear_com, nrow = 1) %*%
+               cov_mat %*%
+               matrix(linear_com, ncol = 1))
+
+  upper <- est + qnorm(1 - signif_cutoff/2)*se
+  lower <- est - qnorm(1 - signif_cutoff/2)*se
+  pval <- pnorm(abs(est/se),lower.tail = FALSE)
+
+
+  results <- matrix( c(est, se, lower, upper, pval), nrow = 1)
+
+  colnames(results) <- c("Estimates", "Standard Errors", "Lower CIs", "Upper CIs", "p-values")
+
+  results <- as.data.frame(results)
+
+  if(sum(pval ==0)>0){
+    results$`p-values` <- as.character(results$`p-values`)
+    results$`p-values`[pval == 0] <- " < 1e-20"
+  } else{
+    #so class of p-values column doesn't depend on value of p-values
+    results$`p-values` <- as.character(signif(results$`p-values`,3))
+  }
+  return(results)
+}
+
+# the below function generates a list of all linear_com pairwise comparisons given nfixed fixed effects 
+generate_linearcomp <- function(nfixed, rem_1st_comp){
+
+  # Generate all possible combinations of two fixed effects
+  combinations <- combn(nfixed, 2)
+  
+  # Initialize an empty list to store the linear expressions
+  linear_expressions <- list()
+  
+  # Loop through each combination and create the linear expression
+  for (i in 1:ncol(combinations)) {
+    # Initialize a vector of zeros
+    expression <- rep(0, nfixed)
+    # Set the baseline effect to 1
+    expression[combinations[1, i]] <- 1
+    # Set the effect to be compared to -1
+    expression[combinations[2, i]] <- -1
+    # Append the expression to the list
+    linear_expressions[[i]] <- expression
+  }
+  
+  # divnet_rs_processing will have already performed pairwise comparisons with the reference level
+    # ie, where the first value in linear_com is 1 
+  # therefore, we can subset out those comparisons from linear_comps if divner_rs_processing has been run
+  if (rem_1st_comp == T) {
+    assign("linear_comps", linear_expressions[-(1:(nfixed-1))], globalenv())
+  } else {
+    assign("linear_comps", linear_expressions, globalenv())
+  }
+}
+
+# the below function performs all other pairwise comparisons for a given set of alpha diversity stats
+  # takes as input the processed Divnet-rs simpson/shannon input 
+    # generated in the "Divnet-rs output processing" section 
+    # contains the pairwise comparison statistics for the reference level
+  # takes this and a vector of linear_comparisons
+# also performs multiple testing correction
+alphadiv_multi <- function(divtable, lincomp){
+
+  # first, import the statistics from the analysis of the initial divnet-rs output as a dataframe
+  # remove the "predictors" string and replace it with the reference level
+  dftest <- setDT(as.data.frame(divtable$table), keep.rownames = "Comparison") 
+  dftest$Comparison <- str_replace_all(dftest$Comparison, "predictors.+?_", "C_2W_v_")
+  
+  # iterate through all the linear comparisons provided
+  for (i in 1:length(lincomp)) {
+    
+    # create names for the baseline and comparison
+    baseline <- rownames(divtable$table)[match(1, as_vector(lincomp[i]))] %>%
+      str_remove("predictors.+?_")
+    compared <- rownames(divtable$table)[match(-1, as_vector(lincomp[i]))] %>%
+      str_remove("predictors.+?_")
+    compname <- paste0(baseline, "_v_", compared)
+    
+    # run betta_lincom and append row to dataframe
+    lincom_output <- betta_lincom(divtable, as_vector(lincomp[i])) %>% mutate(Comparison = compname)
+    dftest <- rbind(dftest, lincom_output, fill = T)
+    
+  }
+  
+  # perform multiple testing correction via Benjamini-Hochberg
+  # takes the p-values for all the pairwise comparisons and corrects them
+  # make the resulting q-values into a column and append it to dftest
+    # need to add NA to the first row (as the intercept does not have a p value)
+  dfqvalues <- as.data.frame(p.adjust(as.numeric(dftest$`p-values`[-1]), method = "BH"))
+  colnames(dfqvalues) <- "qvalues"
+  dfqvalues <- rbind(NA, dfqvalues)
+  dftest <- cbind(dftest, dfqvalues)
+  
+  return(dftest)
+  # 
+  # # assign to the global environment
+  # assign(paste0(substitute(divtable), "_stats"), dftest, globalenv())
+}
+
+
+generate_linearcomp(10, T)
+
+shannon_output_V <- alphadiv_multi(shannon_pairwise_V_total, linear_comps)
+simpson_output_V <- alphadiv_multi(simpson_pairwise_V_total, linear_comps)
+
+shannon_output_F <- alphadiv_multi(shannon_pairwise_F_total, linear_comps)
+simpson_output_F <- alphadiv_multi(simpson_pairwise_F_total, linear_comps)
+
+write.csv(shannon_output_V, "alpha_diversity/shannon_V_stats.csv")
+write.csv(simpson_output_V, "alpha_diversity/simpson_V_stats.csv")
+
+write.csv(shannon_output_F, "alpha_diversity/shannon_F_stats.csv")
+write.csv(simpson_output_F, "alpha_diversity/simpson_F_stats.csv")
+
+```
+
+Make box-whisker alpha diversity plots
+
+```{r}
+
+# data is based on the divnet_rs_processing output for all vaginal or all fecal samples
+# used variance to calculate SD
+# use this as well as the estimate to create a box whisker plot
+
+vag_shan <- as_tibble(read.xlsx("alpha_diversity/all_alpha.xlsx", sheet = 1))[,1:7]
+vag_simp <- as_tibble(read.xlsx("alpha_diversity/all_alpha.xlsx", sheet = 2))[,1:8]
+fec_shan <- as_tibble(read.xlsx("alpha_diversity/all_alpha.xlsx", sheet = 3))[,1:7]
+fec_simp <- as_tibble(read.xlsx("alpha_diversity/all_alpha.xlsx", sheet = 4))[,1:8]
+
+# vaginal shannon data
+p1 <- ggplot(vag_shan, aes(factor(order), Shannon)) +
+  geom_boxplot(aes(
+      lower = Shannon - SD,
+      upper = Shannon + SD,
+      middle = Shannon,
+      ymin = Shannon - 3*SD,
+      ymax = Shannon + 3*SD),
+    stat = "identity") +
+  scale_x_discrete(label = c("Cont D0", "RB51 D0", "Cont 2W", "RB51 2W", 
+                             "Cont Precalve", "RB51 Precalve", "Cont Postcalve", 
+                             "RB51 Postcalve", "Cont Necropsy", "RB51 Necropsy")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+  theme(axis.title.x = element_blank()) +
+  ylab("Shannon Index") +
+  ggtitle("Vaginal Microbiota") +
+  theme(plot.title = element_text(hjust = 0.5))
+p1
+
+# vaginal Gini-simpson data
+p2 <- ggplot(vag_simp, aes(factor(order), Gini)) +
+  geom_boxplot(aes(
+      lower = Gini - SD,
+      upper = Gini + SD,
+      middle = Gini,
+      ymin = Gini - 3*SD,
+      ymax = Gini + 3*SD),
+    stat = "identity") +
+  scale_x_discrete(label = c("Cont D0", "RB51 D0", "Cont 2W", "RB51 2W", 
+                             "Cont Precalve", "RB51 Precalve", "Cont Postcalve", 
+                             "RB51 Postcalve", "Cont Necropsy", "RB51 Necropsy")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+  theme(axis.title.x = element_blank()) +
+  ylab("Gini-Simpson Index") +
+  ggtitle("Vaginal Microbiota") +
+  theme(plot.title = element_text(hjust = 0.5))
+p2
+
+# fecal shannon data
+p3 <- ggplot(fec_shan, aes(factor(order), Shannon)) +
+  geom_boxplot(aes(
+      lower = Shannon - SD,
+      upper = Shannon + SD,
+      middle = Shannon,
+      ymin = Shannon - 3*SD,
+      ymax = Shannon + 3*SD),
+    stat = "identity") +
+  scale_x_discrete(label = c("Cont D0", "RB51 D0", "Cont 2W", "RB51 2W", 
+                             "Cont Precalve", "RB51 Precalve", "Cont Postcalve", 
+                             "RB51 Postcalve", "Cont Necropsy", "RB51 Necropsy")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+  theme(axis.title.x = element_blank()) +
+  ylab("Shannon Index") +
+  ggtitle("Fecal Microbiota") +
+  theme(plot.title = element_text(hjust = 0.5))
+p3
+
+# fecal simpson data
+p4 <- ggplot(fec_simp, aes(factor(order), Gini)) +
+  geom_boxplot(aes(
+      lower = Gini - SD,
+      upper = Gini + SD,
+      middle = Gini,
+      ymin = Gini - 3*SD,
+      ymax = Gini + 3*SD),
+    stat = "identity") +
+  scale_x_discrete(label = c("Cont D0", "RB51 D0", "Cont 2W", "RB51 2W", 
+                             "Cont Precalve", "RB51 Precalve", "Cont Postcalve", 
+                             "RB51 Postcalve", "Cont Necropsy", "RB51 Necropsy")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+  theme(axis.title.x = element_blank()) +
+  #theme(axis.text.y = element_text(size = 10)) +
+  ylab("Gini-Simpson Index") +
+  ggtitle("Fecal Microbiota") +
+  theme(plot.title = element_text(hjust = 0.5))
+p4
+
+alphfig <- ggarrange(p3,p4,p1,p2,
+          labels = c("B","C","E","F"),
+          ncol = 2, nrow = 2)
+
+alphfig
+
+ggsave(file = "../Paper/tables_and_figures/alphadiversity.svg", width = 8.5, height = 7.5, plot = alphfig)
+
+# ggsave(file = "../Paper/tables_and_figures/vag_shan.svg", width = 10, height = 7, plot = p1)
+# ggsave(file = "../Paper/tables_and_figures/vag_simp.svg", width = 10, height = 7, plot = p2)
+# ggsave(file = "../Paper/tables_and_figures/fec_shan.svg", width = 10, height = 7, plot = p3)
+# ggsave(file = "../Paper/tables_and_figures/fec_simp.svg", width = 10, height = 7, plot = p4)
+
+```
+
+
+Corncob - running Corncob for all pairwise comparisons
+
+```{r}
+
+# make function to pull ALL estimated relative abundances from a differentialTest object
+get_relative_abundance <- function(da_output, phyloseq_data_full, taxa_level) {
+  my.ra <- as_tibble(phyloseq_data_full@sam_data) %>% select(Type, Vax_Status, Sample_ID)
+
+  # iterate over the taxonomic classifications of all OTUs (rows) in the dataset
+  # output the row we're on when the row is a number divisible by 100 plus 1
+  for (i in 1:(nrow(da_output$data@tax_table))) {
+    # if((i-1)%%100==0) {print(i)}
+
+    # for each OTU, pull the taxonomic classification
+    # then keep the relevant taxonomic info for the contrast
+    # keep the OTU that corncob associated with a phylum or genus
+    current.OTU <- rownames(da_output$data@tax_table)[i]
+
+    if(taxa_level=="Phylum") {
+      current.full <- paste0(as_tibble(da_output$data@tax_table@.Data)$Phylum[i], "_(", current.OTU, ")")
+
+    } else if (taxa_level=="Genus") {
+      current.full <- paste0(as_tibble(phyloseq_data_full@tax_table@.Data)$Phylum[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Class[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Order[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Family[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Genus[i], "_(",
+                             current.OTU, ")")
+
+    } else if (taxa_level=="OTU") {
+      current.full <- paste0(current.OTU, "_(",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Phylum[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Class[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Order[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Family[i], "_",
+                             as_tibble(phyloseq_data_full@tax_table@.Data)$Genus[i], ")")
+
+    } else {warning("check taxa level input")}
+
+    # pull relative abundance from the mu.resp vector of the significant model
+    tryCatch({
+      temp <- tibble(ra=unname(da_output$all_models[[i]]$mu.resp),
+                     Sample_ID=rownames(da_output$all_models[[i]]$mu.resp)) %>%
+        rename_with(.fn=~paste0(
+          #., "_",
+          current.full), .cols=-Sample_ID)
+
+      my.ra <- left_join(my.ra, temp, by="Sample_ID")
+
+    },
+    error=function(e){# if warning, skip this phylum
+      # print(e)
+    })
+
+    rm(current.OTU, current.full)
+  }
+  return(my.ra)
+}
+
+# make function to pull only differentially abundant taxa from the output
+pull_diffabun <- function(relabund_workbook, difftest, tax_level) {
+
+  # for the taxonomic level, pull the correct sheet from the workbook
+  # also replace the list of taxa with the phylum or genus names and append taxonomic information to OTU
+  # phylum
+  if (tax_level == "phylum") {
+    sheetnum = 2
+    difftax_list <- as.vector(difftest$significant_taxa)
+
+    # for each differentially abundant phylum, pull the representative OTU designated by corncob
+    # pull the phylum name associated with that OTU and swap it into the list for the OTU
+    for (i in difftax_list) {
+      print(paste0("phylum=", i))
+      phylum_tax <- paste0(as.vector(difftest$data@tax_table[i])[2], "_(", i, ")")
+      difftax_list <- replace(difftax_list, i, phylum_tax)
+    }
+
+  # genus
+  } else if (tax_level == "genus") {
+    sheetnum = 3
+    difftax_list <- as.vector(difftest$significant_taxa)
+
+    # for each differentially abundant genus, pull the representative OTU designated by corncob
+    # pull the complete taxonomy associated with that OTU and swap it into the list for the OTU
+    for (i in difftax_list) {
+      print(paste0("genus=", i))
+      genus_tax <- paste0(paste0(as.vector(difftest$data@tax_table[i])[2:6], collapse = "_"), "_(", i, ")")
+      difftax_list <- replace(difftax_list, i, genus_tax)
+    }
+
+  } else if (tax_level == "otu") {
+    sheetnum = 4
+    difftax_list <- as.list(difftest$significant_taxa)
+
+    # for each differentially abundant OTU, pull the associated taxonomic info and append it
+    for (i in difftax_list) {
+      print(paste0("otu=", i))
+      otu_tax <- paste0(i, "_(",paste0(as.vector(difftest$data@tax_table[i])[2:6], collapse = "_"), ")")
+      difftax_list <- replace(difftax_list, i, otu_tax)
+    }
+
+  }
+
+  workbookvar <- as_tibble(read.xlsx(relabund_workbook, sheet = sheetnum, startRow = 1))
+  signif_taxa <- as.list(c("Type", "Vax_Status", "Sample_ID", difftax_list))
+
+  tax_and_ra <- subset(workbookvar, select = names(workbookvar) %in% signif_taxa)
+  return(tax_and_ra)
+}
+
+# make a function to break an object into smaller objects, containing only info for a specific tax level
+# then run corncob on each of the smaller objects
+# run the above two functions on the smaller objects
+# it's called Iowa because it does multiple corncobs, get it?
+iowa <- function(phyobj) {
+
+  # break into tax levels
+  data_phylum <- phyobj %>% tax_glom("Phylum")
+  data_genus <- phyobj %>% tax_glom("Genus")
+  data_otu <- phyobj
+
+  # need to identify what is going to be compared for this phyloseq object: vax status or timepoint
+  # the last part of the phyobj's name indicates what is to be compared
+  # if it's CvR, then vax status
+  # otherwise, time is the variable to compare by
+  compar_var <- str_remove(string = deparse(substitute(phyobj)), pattern = ".+_")
+  print(compar_var)
+  if (compar_var == "CvR") {
+    formcompar = "Vax_Status"
+  } else if (compar_var == "final") {
+    formcompar = "Type"
+  } else if (compar_var == "total") {
+    formcompar = "Vax_Status + Time"
+  } else if (compar_var == "individual") {
+    formcompar = "Sample_ID"
+  } else {
+    formcompar = "Time"
+  }
+
+  # run corncob for each taxonomic level
+  # Phylum
+  relabun_phy <- differentialTest(formula = as.formula(paste0(" ~ ", formcompar)),
+                                 phi.formula = as.formula(paste0(" ~ ", formcompar)),
+                                 formula_null = ~ 1,
+                                 phi.formula_null = as.formula(paste0(" ~ ", formcompar)),
+                                 test = "Wald", boot = FALSE,
+                                 data = data_phylum,
+                                 fdr_cutoff = 0.05)
+  # otu_to_taxonomy(OTU = relabun$significant_taxa, data = data_otu)
+  # plot(relabun)
+  # output to global environment
+  # assign(paste0("corncob_", deparse(substitute(phyobj)), "_phylum"), relabun_phy, envir = .GlobalEnv)
+  # Genus
+
+  relabun_gen <- differentialTest(formula = as.formula(paste0(" ~ ", formcompar)),
+                                 phi.formula = as.formula(paste0(" ~ ", formcompar)),
+                                 formula_null = ~ 1,
+                                 phi.formula_null = as.formula(paste0(" ~ ", formcompar)),
+                                 test = "Wald", boot = FALSE,
+                                 data = data_genus,
+                                 fdr_cutoff = 0.05)
+  # otu_to_taxonomy(OTU = relabun$significant_taxa, data = data_otu)
+  # plot(relabun)
+  # output to global environment
+  # assign(paste0("corncob_", deparse(substitute(phyobj)), "_genus"), relabun_gen, envir = .GlobalEnv)
+
+  # OTU
+  relabun_otu <- differentialTest(formula = as.formula(paste0(" ~ ", formcompar)),
+                                 phi.formula = as.formula(paste0(" ~ ", formcompar)),
+                                 formula_null = ~ 1,
+                                 phi.formula_null = as.formula(paste0(" ~ ", formcompar)),
+                                 test = "Wald", boot = FALSE,
+                                 data = data_otu,
+                                 fdr_cutoff = 0.05)
+  # otu_to_taxonomy(OTU = relabun$significant_taxa, data = data_otu)
+  # plot(relabun)
+  # output to global environment
+  # assign(paste0("corncob_", deparse(substitute(phyobj)), "_otu"), relabun_otu, envir = .GlobalEnv)
+
+  # now use the earlier function to pull all taxa and their relative abundances
+  # start by creating an excel workbook using openxlsx (gets around the Java dependency of xlsx)
+  # then call get_relative_abundance to pull the data and paste it into the appropriate sheet
+  # store name of pairwise comparison in variable to make expressions easier to read
+  workbook <- createWorkbook()
+
+  name_pairwise <- str_remove(string = deparse(substitute(phyobj)), pattern = "subset_")
+  addWorksheet(workbook, paste0("Diffabund_",name_pairwise))
+  addWorksheet(workbook, paste0("Phylum_", name_pairwise))
+  addWorksheet(workbook, paste0("Genus_", name_pairwise))
+  addWorksheet(workbook, paste0("OTU_", name_pairwise))
+
+  # ALL relative abundances for each taxonomic level
+  # phylum
+  writeData(workbook,
+    paste0("Phylum_", name_pairwise),
+    get_relative_abundance(
+        da_output = relabun_phy, phyloseq_data_full = data_phylum, taxa_level = "Phylum"),
+    startRow = 1, startCol = 1)
+
+  #genus
+  writeData(workbook,
+    paste0("Genus_", name_pairwise),
+    get_relative_abundance(
+        da_output = relabun_gen, phyloseq_data_full = data_genus, taxa_level = "Genus"),
+    startRow = 1, startCol = 1)
+
+  #otu
+  writeData(workbook,
+    paste0("OTU_", name_pairwise),
+    get_relative_abundance(
+        da_output = relabun_otu, phyloseq_data_full = data_otu, taxa_level = "OTU"),
+    startRow = 1, startCol = 1)
+
+  saveWorkbook(workbook, file =
+        paste0("corncob_output/corncob_", name_pairwise, ".xlsx"), overwrite = TRUE)
+
+  # pulling only significant taxa and their relative abundances
+  # phylum
+  writeData(workbook,
+    paste0("Diffabund_",name_pairwise),
+    pull_diffabun(paste0("corncob_output/corncob_", name_pairwise, ".xlsx"), relabun_phy, "phylum"),
+    startRow = 1, startCol = 1)
+
+    # genus
+  writeData(workbook,
+    paste0("Diffabund_",name_pairwise),
+    pull_diffabun(paste0("corncob_output/corncob_", name_pairwise, ".xlsx"), relabun_gen, "genus"),
+    startRow = 75, startCol = 1)
+
+    # otu
+  writeData(workbook,
+    paste0("Diffabund_",name_pairwise),
+    pull_diffabun(paste0("corncob_output/corncob_", name_pairwise, ".xlsx"), relabun_otu, "otu"),
+    startRow = 150, startCol = 1)
+
+    saveWorkbook(workbook, file =
+        paste0("corncob_output/corncob_", name_pairwise, ".xlsx"), overwrite = TRUE)
+}
+
+# run to get a general estimate of relative abundance for a given taxon in a given sample type
+iowa(subset_V_total) # ran successfully 8-30-23
+iowa(subset_F_total) # ran successfully 8-30-23
+
+
+```
